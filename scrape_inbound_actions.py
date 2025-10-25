@@ -104,7 +104,7 @@ def build_row(name: str, files: Dict[str, str]) -> Dict[str, str]:
     repo_path = f"{FOLDER}/{name}"
 
     return {
-        "name": name,
+        "title": name,
         "description": readme,  # Full Markdown as requested
         "code": code,
         "repo_path": repo_path,
@@ -131,7 +131,7 @@ def main():
 
     df = scrape()
     df = df[[
-        "name", "description", "code", "repo_path"
+        "title", "description", "code", "repo_path"
     ]]
 
     df.to_excel(args.out, index=False)

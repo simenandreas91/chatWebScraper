@@ -1,7 +1,7 @@
 import os, re, time, argparse
 from collections import defaultdict
 from dotenv import load_dotenv
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 import requests, pandas as pd
 
 OWNER  = "ServiceNowDevProgram"
@@ -47,8 +47,8 @@ def fetch_raw(path: str) -> str:
     return req("GET", url).text
 
 
-def group_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
-    grouped = defaultdict(lambda: {"readme": "", "js": ""})
+def group_files(tree: List[Dict]) -> Dict[str, Dict[str, Any]]:
+    grouped = defaultdict(lambda: {"readme": "", "js": []})
     prefix = f"{FOLDER}/"
     for node in tree:
         if node.get("type") != "blob":
@@ -65,7 +65,7 @@ def group_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
         if low == "readme.md":
             grouped[folder]["readme"] = path
         elif low.endswith(".js"):
-            grouped[folder]["js"] = path
+            grouped[folder]["js"].append(path)
     return grouped
 
 
@@ -135,6 +135,115 @@ def parse_description(md: str) -> str:
     return ""
 
 
+# -------- Script categorization helpers --------
+
+CLIENT_NAME_HINTS = (
+    "client",
+    "onload",
+    "onchange",
+    "onsubmit",
+    "oncelledit",
+    "catalog",
+    "portal",
+    "script",
+    "mrvs",
+)
+
+INCLUDE_NAME_HINTS = (
+    "include",
+    "ajax",
+    "util",
+    "utils",
+    "provider",
+    "processor",
+    "server",
+)
+
+
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def readme_mentions(filename: str, lines: List[str], keyword: str) -> bool:
+    """Return True if README references filename alongside keyword (case-insensitive)."""
+    if not lines:
+        return False
+    token = _normalize_token(os.path.splitext(filename)[0])
+    if not token:
+        return False
+    needle = keyword.lower()
+    for line in lines:
+        low = line.lower()
+        if needle in low:
+            if token in _normalize_token(line):
+                return True
+    return False
+
+
+def infer_js_role(filename: str, code: str, readme_lines: List[str]) -> str:
+    """Best-effort classification of JS files into client vs. script include."""
+    name = filename.lower()
+    content = code.lower()
+
+    if readme_mentions(filename, readme_lines, "script include") or readme_mentions(filename, readme_lines, "server script"):
+        return "script_include"
+    if readme_mentions(filename, readme_lines, "client script"):
+        return "client"
+
+    if any(hint in name for hint in INCLUDE_NAME_HINTS):
+        if "g_form" not in content:
+            return "script_include"
+
+    if any(hint in name for hint in CLIENT_NAME_HINTS):
+        return "client"
+
+    if any(trigger in content for trigger in ("function onload", "function onchange", "function onsubmit", "function oncelledit")):
+        return "client"
+    if "g_form" in content or "g_scratchpad" in content:
+        return "client"
+
+    if "class.create" in content or "prototype =" in content or "gs." in content or "gliderecord" in content:
+        if "g_form" not in content:
+            return "script_include"
+
+    return "unknown"
+
+
+def split_js_files(entries: List[Tuple[str, str]], readme_lines: List[str]) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """Split list of (filename, code) pairs into client scripts and script includes."""
+    clients: List[Tuple[str, str]] = []
+    includes: List[Tuple[str, str]] = []
+    unknown: List[Tuple[str, str]] = []
+
+    for filename, code in entries:
+        role = infer_js_role(filename, code, readme_lines)
+        if role == "client":
+            clients.append((filename, code))
+        elif role == "script_include":
+            includes.append((filename, code))
+        else:
+            unknown.append((filename, code))
+
+    if not clients and unknown:
+        clients.append(unknown.pop(0))
+    includes.extend(unknown)
+
+    return clients, includes
+
+
+def combine_scripts(entries: List[Tuple[str, str]]) -> str:
+    """Combine multiple script files into a single string (joined by blank lines)."""
+    if not entries:
+        return ""
+    parts = []
+    for filename, code in sorted(entries, key=lambda item: item[0].lower()):
+        stripped = code.strip()
+        if not stripped:
+            continue
+        parts.append(stripped)
+    return "\n\n".join(parts)
+
+
 def scrape() -> pd.DataFrame:
     sha = get_branch_sha()
     tree = list_tree_recursive(sha)
@@ -143,17 +252,27 @@ def scrape() -> pd.DataFrame:
     rows = []
     for folder, files in sorted(grouped.items()):
         md  = fetch_raw(files["readme"]) if files["readme"] else ""
-        js  = fetch_raw(files["js"])     if files["js"] else ""
+        readme_lines = md.splitlines()
+
+        js_entries: List[Tuple[str, str]] = []
+        for path in files["js"]:
+            filename = os.path.basename(path)
+            js_entries.append((filename, fetch_raw(path)))
+
+        client_entries, include_entries = split_js_files(js_entries, readme_lines)
+        client_script = combine_scripts(client_entries)
+        script_include = combine_scripts(include_entries)
 
         rows.append({
-            "name":        parse_name(md, folder),
+            "title":       parse_name(md, folder),
             "applies_to":  parse_applies_to(md) or "A Catalog Item",
             "ui_type":     parse_ui_type(md) or "All",
             "sys_scope":   parse_sys_scope(md),
             "type":        parse_type(md),
             "cat_item":    parse_cat_item(md),
             "description": parse_description(md),
-            "script":      js,
+            "client_script": client_script,
+            "script_include": script_include,
         })
 
     return pd.DataFrame(rows)
@@ -165,7 +284,17 @@ def main():
     args = ap.parse_args()
 
     df = scrape()
-    df = df[["name", "applies_to", "ui_type", "sys_scope", "type", "cat_item", "description", "script"]]
+    df = df[[
+        "title",
+        "applies_to",
+        "ui_type",
+        "sys_scope",
+        "type",
+        "cat_item",
+        "description",
+        "client_script",
+        "script_include",
+    ]]
     df.to_excel(args.out, index=False)
     print(f"Saved {len(df)} rows to {args.out}")
 

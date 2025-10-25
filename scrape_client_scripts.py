@@ -1,7 +1,7 @@
 import os, re, time, argparse
 from dotenv import load_dotenv
 from collections import defaultdict, Counter
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 import requests, pandas as pd
 
 OWNER  = "ServiceNowDevProgram"
@@ -46,9 +46,9 @@ def fetch_raw(path: str) -> str:
     return req("GET", url).text
 
 
-def group_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
-    """Return mapping: <folder> -> {'readme': path, 'js': path} under our client-scripts folder."""
-    grouped = defaultdict(lambda: {"readme": "", "js": ""})
+def group_files(tree: List[Dict]) -> Dict[str, Dict[str, Any]]:
+    """Return mapping: <folder> -> {'readme': path, 'js': [paths]} under our client-scripts folder."""
+    grouped = defaultdict(lambda: {"readme": "", "js": []})
     prefix = f"{FOLDER}/"
     for node in tree:
         if node.get("type") != "blob":
@@ -65,7 +65,7 @@ def group_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
         if low == "readme.md":
             grouped[folder]["readme"] = path
         elif low.endswith(".js"):
-            grouped[folder]["js"] = path
+            grouped[folder]["js"].append(path)
     return grouped
 
 
@@ -158,6 +158,114 @@ def parse_table_from_code(js: str) -> str:
     return ""
 
 
+# -------- Script categorization helpers --------
+
+CLIENT_NAME_HINTS = (
+    "client",
+    "onload",
+    "onchange",
+    "onsubmit",
+    "oncelledit",
+    "onvaluechange",
+    "catalog",
+    "portal",
+    "script",
+)
+
+INCLUDE_NAME_HINTS = (
+    "include",
+    "ajax",
+    "util",
+    "utils",
+    "provider",
+    "server",
+    "processor",
+)
+
+
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def readme_mentions(filename: str, lines: List[str], keyword: str) -> bool:
+    """Return True if README references filename alongside keyword (case-insensitive)."""
+    if not lines:
+        return False
+    token = _normalize_token(os.path.splitext(filename)[0])
+    if not token:
+        return False
+    needle = keyword.lower()
+    for line in lines:
+        low = line.lower()
+        if needle in low and token in _normalize_token(line):
+            return True
+    return False
+
+
+def infer_js_role(filename: str, code: str, readme_lines: List[str]) -> str:
+    """Best-effort classification of JS files into client vs. script include."""
+    name = filename.lower()
+    content = code.lower()
+
+    if readme_mentions(filename, readme_lines, "script include") or readme_mentions(filename, readme_lines, "server script"):
+        return "script_include"
+    if readme_mentions(filename, readme_lines, "client script"):
+        return "client"
+
+    if any(hint in name for hint in INCLUDE_NAME_HINTS):
+        if "g_form" not in content:
+            return "script_include"
+
+    if any(hint in name for hint in CLIENT_NAME_HINTS):
+        return "client"
+
+    if any(trigger in content for trigger in ("function onload", "function onchange", "function onsubmit", "function oncelledit", "function onvaluechange")):
+        return "client"
+    if "g_form" in content or "g_scratchpad" in content:
+        return "client"
+
+    if "class.create" in content or "prototype =" in content or "gs." in content or "gliderecord" in content:
+        if "g_form" not in content:
+            return "script_include"
+
+    return "unknown"
+
+
+def split_js_files(entries: List[Tuple[str, str]], readme_lines: List[str]) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """Split list of (filename, code) pairs into client scripts and script includes."""
+    clients: List[Tuple[str, str]] = []
+    includes: List[Tuple[str, str]] = []
+    unknown: List[Tuple[str, str]] = []
+
+    for filename, code in entries:
+        role = infer_js_role(filename, code, readme_lines)
+        if role == "client":
+            clients.append((filename, code))
+        elif role == "script_include":
+            includes.append((filename, code))
+        else:
+            unknown.append((filename, code))
+
+    if not clients and unknown:
+        clients.append(unknown.pop(0))
+    includes.extend(unknown)
+
+    return clients, includes
+
+
+def combine_scripts(entries: List[Tuple[str, str]]) -> str:
+    """Combine multiple script files into a single string (joined by blank lines)."""
+    if not entries:
+        return ""
+    parts = []
+    for filename, code in sorted(entries, key=lambda item: item[0].lower()):
+        stripped = code.strip()
+        if not stripped:
+            continue
+        parts.append(stripped)
+    return "\n\n".join(parts)
+
+
 def scrape() -> pd.DataFrame:
     sha = get_branch_sha()
     tree = list_tree_recursive(sha)
@@ -166,19 +274,30 @@ def scrape() -> pd.DataFrame:
     rows = []
     for folder, files in sorted(grouped.items()):
         readme_md = fetch_raw(files["readme"]) if files["readme"] else ""
-        js_code   = fetch_raw(files["js"]) if files["js"] else ""
+        readme_lines = readme_md.splitlines()
+
+        js_entries: List[Tuple[str, str]] = []
+        for path in files["js"]:
+            filename = os.path.basename(path)
+            js_entries.append((filename, fetch_raw(path)))
+
+        client_entries, include_entries = split_js_files(js_entries, readme_lines)
+        client_script = combine_scripts(client_entries)
+        script_include = combine_scripts(include_entries)
+
+        analysis_code = client_script or script_include
 
         event = parse_event(readme_md) if readme_md else ""
         table = parse_table_from_readme(readme_md) if readme_md else ""
-        if not table and js_code:
-            table = parse_table_from_code(js_code)
+        if not table and analysis_code:
+            table = parse_table_from_code(analysis_code)
 
         desc  = parse_description(readme_md) if readme_md else ""
 
-        # Field name: README first, else infer from code (top 1–3 joined by comma)
+        # Field name: README first, else infer from code (top 1-3 joined by comma)
         field_name = parse_field_from_readme(readme_md) if readme_md else ""
-        if not field_name and js_code:
-            fields = parse_fields_from_code(js_code)
+        if not field_name and client_script:
+            fields = parse_fields_from_code(client_script)
             if fields:
                 # If multiple, list the first 3 (most frequent) comma-separated.
                 field_name = ", ".join(fields[:3])
@@ -189,7 +308,8 @@ def scrape() -> pd.DataFrame:
             "table": table,
             "field_name": field_name,
             "description": desc,
-            "code": js_code,
+            "client_script": client_script,
+            "script_include": script_include,
         })
 
     return pd.DataFrame(rows)
@@ -201,6 +321,15 @@ def main():
     args = ap.parse_args()
 
     df = scrape()
+    df = df[[
+        "title",
+        "event",
+        "table",
+        "field_name",
+        "description",
+        "client_script",
+        "script_include",
+    ]]
     df.to_excel(args.out, index=False)
     print(f"Saved {len(df)} rows to {args.out}")
 

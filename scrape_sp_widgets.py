@@ -153,7 +153,7 @@ def build_row(name: str, files: Dict[str, str]) -> Dict[str, str]:
     repo_path = f"{FOLDER}/{name}"  # <--- NEW
 
     return {
-        "name": name,
+        "title": name,
         "description": readme,
         "html": html,
         "css": css,
@@ -187,7 +187,7 @@ def main():
 
     df = scrape()
     df = df[[
-    "name", "description", "html", "css", "server_script", "client_script",
+    "title", "description", "html", "css", "server_script", "client_script",
     "controller_as", "link", "demo_data", "option_schema", "repo_path"
     ]]
 
