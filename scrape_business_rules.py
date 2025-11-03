@@ -135,50 +135,69 @@ def extract_code_from_readme(readme: str) -> str:
     return ""
 
 
+ALLOWED_WHEN_VALUES = ("before", "after", "async", "display")
+
 WHEN_PATTERNS = [
     r"(?i)\bwhen\s*to\s*run\s*[:\-]\s*([^\n]+)",
     r"(?i)\brun\s*when\s*[:\-]\s*([^\n]+)",
     r"(?i)\bwhen\s*[:\-]\s*([^\n]+)",
 ]
 
-COLLECTION_PATTERNS = [
-    r"(?i)\bcollection\s*[:\-]\s*([^\n]+)",
-    r"(?i)\btable\s*[:\-]\s*([^\n]+)",
-    r"(?i)\bon\s+table\s*[:\-]?\s*([^\n]+)",
-    r"(?i)\bruns?\s+on\s+table\s*[:\-]?\s*([^\n]+)",
-    r"(?i)\bapplies\s*to\s*[:\-]\s*([^\n]+)",
-]
-
 WHEN_KEYWORDS = ("before", "after", "async", "asynchronous", "display")
+
+
+def normalize_when_value(text: str) -> str:
+    if not text:
+        return ""
+    lowered = text.lower()
+    if "asynch" in lowered:
+        return "async"
+    for token in ALLOWED_WHEN_VALUES:
+        if re.search(rf"\b{token}\b", lowered):
+            return token
+    if "on display" in lowered:
+        return "display"
+    return ""
 
 
 def parse_when_to_run(md: str) -> str:
     for pattern in WHEN_PATTERNS:
         m = re.search(pattern, md)
         if m:
-            return m.group(1).strip()
+            normalized = normalize_when_value(m.group(1))
+            if normalized:
+                return normalized
     for line in md.splitlines():
         text = line.strip()
         if not text or text.startswith("#"):
             continue
         lower = text.lower()
-        if any(keyword in lower for keyword in WHEN_KEYWORDS) and ("when" in lower or "run" in lower or "execution" in lower):
-            return text
+        if any(keyword in lower for keyword in WHEN_KEYWORDS):
+            normalized = normalize_when_value(text)
+            if normalized:
+                return normalized
     return ""
 
 
+def extract_collection_candidates(md: str) -> List[str]:
+    pattern = re.compile(
+        r"(?i)\b(table|collection|runs?\s+on|applies\s+to)\s*[:\-]?\s*([`'\"]?[A-Za-z0-9_\.]+(?:[`'\"]?\s*,\s*[`'\"]?[A-Za-z0-9_\.]+)*)"
+    )
+    matches = pattern.findall(md)
+    results: List[str] = []
+    for _label, value in matches:
+        value = value.strip().strip("`'\"")
+        for part in re.split(r"\s*,\s*", value):
+            part = part.strip().strip("`'\"")
+            if part:
+                results.append(part)
+    return results
+
+
 def parse_collection(md: str) -> str:
-    for pattern in COLLECTION_PATTERNS:
-        m = re.search(pattern, md)
-        if m:
-            return m.group(1).strip()
-    for line in md.splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        lower = text.lower()
-        if "table" in lower or "collection" in lower:
-            return text
+    candidates = extract_collection_candidates(md)
+    if candidates:
+        return candidates[0]
     return ""
 
 
