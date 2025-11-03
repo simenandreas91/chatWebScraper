@@ -1,4 +1,6 @@
 import os, re, time, argparse
+from datetime import datetime, timezone
+from functools import lru_cache
 from collections import defaultdict
 from dotenv import load_dotenv
 from typing import Any, Dict, List, Tuple
@@ -18,6 +20,8 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     S.headers.update({"Authorization": f"Bearer {TOKEN}"})
+
+RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
 
 
 def req(method: str, url: str, **kw):
@@ -45,6 +49,35 @@ def list_tree_recursive(sha: str) -> List[Dict]:
 def fetch_raw(path: str) -> str:
     url = f"{RAW_BASE}/{OWNER}/{REPO}/{BRANCH}/{path}"
     return req("GET", url).text
+
+
+@lru_cache(maxsize=None)
+def latest_commit_datetime(path: str):
+    if not path:
+        return None
+    r = req(
+        "GET",
+        f"{API_BASE}/repos/{OWNER}/{REPO}/commits",
+        params={"path": path, "sha": BRANCH, "per_page": 1},
+    )
+    commits = r.json()
+    if not commits:
+        return None
+    commit_info = commits[0].get("commit", {})
+    date_str = (
+        commit_info.get("committer", {}) or {}
+    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
+    if not date_str:
+        return None
+    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
+
+def is_recent(paths: List[str]) -> bool:
+    for path in paths:
+        ts = latest_commit_datetime(path)
+        if ts and ts > RECENCY_CUTOFF:
+            return True
+    return False
 
 
 def group_files(tree: List[Dict]) -> Dict[str, Dict[str, Any]]:
@@ -191,8 +224,7 @@ def infer_js_role(filename: str, code: str, readme_lines: List[str]) -> str:
         return "client"
 
     if any(hint in name for hint in INCLUDE_NAME_HINTS):
-        if "g_form" not in content:
-            return "script_include"
+        return "script_include"
 
     if any(hint in name for hint in CLIENT_NAME_HINTS):
         return "client"
@@ -202,9 +234,14 @@ def infer_js_role(filename: str, code: str, readme_lines: List[str]) -> str:
     if "g_form" in content or "g_scratchpad" in content:
         return "client"
 
-    if "class.create" in content or "prototype =" in content or "gs." in content or "gliderecord" in content:
-        if "g_form" not in content:
-            return "script_include"
+    if (
+        "abstractajaxprocessor" in content
+        or "this.getparameter" in content
+        or "class.create" in content and ("prototype" in content or "extendsobject" in content)
+        or "gs." in content
+        or "gliderecord" in content
+    ):
+        return "script_include"
 
     return "unknown"
 
@@ -244,6 +281,33 @@ def combine_scripts(entries: List[Tuple[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
+COMBINED_INCLUDE_RE = re.compile(
+    r"(?is)^(?P<client>.*?)(?P<include>(?:/\*.*?\*/\s*)?(?:var|let|const)\s+[A-Za-z0-9_]+\s*=\s*Class\.create\([\s\S]*)"
+)
+COMBINED_ABSTRACT_RE = re.compile(
+    r"(?is)^(?P<client>.*?)(?P<include>[\s\S]*?AbstractAjaxProcessor[\s\S]*)"
+)
+
+
+def split_combined_client_and_include(text: str) -> Tuple[str, str]:
+    """
+    Some snippets ship both client + script include code in a single .js file.
+    Try to split them by spotting common Script Include markers.
+    """
+    if not text:
+        return "", ""
+    match = COMBINED_INCLUDE_RE.search(text)
+    if not match:
+        match = COMBINED_ABSTRACT_RE.search(text)
+    if not match:
+        return "", ""
+    client = (match.group("client") or "").strip()
+    include = (match.group("include") or "").strip()
+    if not include:
+        return "", ""
+    return client, include
+
+
 def scrape() -> pd.DataFrame:
     sha = get_branch_sha()
     tree = list_tree_recursive(sha)
@@ -251,6 +315,11 @@ def scrape() -> pd.DataFrame:
 
     rows = []
     for folder, files in sorted(grouped.items()):
+        repo_path = f"{FOLDER}/{folder}"
+        candidates = [files["readme"], repo_path] + files["js"]
+        if not is_recent(candidates):
+            continue
+
         md  = fetch_raw(files["readme"]) if files["readme"] else ""
         readme_lines = md.splitlines()
 
@@ -262,6 +331,11 @@ def scrape() -> pd.DataFrame:
         client_entries, include_entries = split_js_files(js_entries, readme_lines)
         client_script = combine_scripts(client_entries)
         script_include = combine_scripts(include_entries)
+        if not script_include and client_script:
+            split_client, split_include = split_combined_client_and_include(client_script)
+            if split_include:
+                client_script = split_client
+                script_include = split_include
 
         rows.append({
             "title":       parse_name(md, folder),
@@ -280,7 +354,8 @@ def scrape() -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser(description="Scrape Catalog Client Scripts")
-    ap.add_argument("--out", default="catalog_client_scripts.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-xlsx", default="spreadsheets/catalog_client_scripts.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-csv", default="spreadsheets/catalog_client_scripts.csv", help="Output .csv filename")
     args = ap.parse_args()
 
     df = scrape()
@@ -295,8 +370,17 @@ def main():
         "client_script",
         "script_include",
     ]]
-    df.to_excel(args.out, index=False)
-    print(f"Saved {len(df)} rows to {args.out}")
+
+    out_dir = os.path.dirname(args.out_xlsx) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    df.to_excel(args.out_xlsx, index=False)
+    if args.out_csv:
+        df.to_csv(args.out_csv, index=False)
+
+    print(f"Saved {len(df)} rows to {args.out_xlsx}")
+    if args.out_csv:
+        print(f"Saved CSV export to {args.out_csv}")
 
 
 if __name__ == "__main__":

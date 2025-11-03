@@ -1,4 +1,6 @@
 import os, re, time, argparse
+from datetime import datetime, timezone
+from functools import lru_cache
 from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from typing import Dict, List
@@ -17,6 +19,8 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     S.headers.update({"Authorization": f"Bearer {TOKEN}"})
+
+RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
 
 
 def req(method: str, url: str, **kw):
@@ -44,6 +48,35 @@ def list_tree_recursive(sha: str) -> List[Dict]:
 def fetch_raw(path: str) -> str:
     url = f"{RAW_BASE}/{OWNER}/{REPO}/{BRANCH}/{path}"
     return req("GET", url).text
+
+
+@lru_cache(maxsize=None)
+def latest_commit_datetime(path: str):
+    if not path:
+        return None
+    r = req(
+        "GET",
+        f"{API_BASE}/repos/{OWNER}/{REPO}/commits",
+        params={"path": path, "sha": BRANCH, "per_page": 1},
+    )
+    commits = r.json()
+    if not commits:
+        return None
+    commit_info = commits[0].get("commit", {})
+    date_str = (
+        commit_info.get("committer", {}) or {}
+    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
+    if not date_str:
+        return None
+    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
+
+def is_recent(paths: List[str]) -> bool:
+    for path in paths:
+        ts = latest_commit_datetime(path)
+        if ts and ts > RECENCY_CUTOFF:
+            return True
+    return False
 
 
 def group_scheduled_jobs_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
@@ -153,6 +186,11 @@ def scrape() -> pd.DataFrame:
 
     rows = []
     for folder, files in sorted(grouped.items()):
+        repo_path = f"{FOLDER}/{folder}"
+        candidates = [files["readme"], files["js"], repo_path]
+        if not is_recent(candidates):
+            continue
+
         readme_md = fetch_raw(files["readme"]) if files["readme"] else ""
         js_code   = fetch_raw(files["js"]) if files["js"] else ""
 
@@ -184,17 +222,21 @@ def scrape() -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser(description="Scrape Scheduled Jobs from code-snippets repo")
-    ap.add_argument("--out", default="spreadsheets/scheduled_jobs.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-xlsx", default="spreadsheets/scheduled_jobs.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-csv", default="spreadsheets/scheduled_jobs.csv", help="Output .csv filename")
     args = ap.parse_args()
 
     df = scrape()
-    xlsx_path = args.out
-    df.to_excel(xlsx_path, index=False)
+    out_dir = os.path.dirname(args.out_xlsx) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
-    csv_path = xlsx_path.replace(".xlsx", ".csv")
-    df.to_csv(csv_path, index=False)
+    df.to_excel(args.out_xlsx, index=False)
+    if args.out_csv:
+        df.to_csv(args.out_csv, index=False)
 
-    print(f"Saved {len(df)} scheduled jobs to {xlsx_path} and {csv_path}")
+    print(f"Saved {len(df)} scheduled jobs to {args.out_xlsx}")
+    if args.out_csv:
+        print(f"Saved CSV export to {args.out_csv}")
 
 
 if __name__ == "__main__":

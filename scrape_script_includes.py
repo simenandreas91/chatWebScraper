@@ -2,6 +2,8 @@ import os
 import re
 import time
 import argparse
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Dict, List, Optional
 
 import requests
@@ -10,6 +12,7 @@ from dotenv import load_dotenv
 
 OWNER = "ServiceNowDevProgram"
 REPO  = "code-snippets"
+BRANCH = "main"
 API_BASE = "https://api.github.com"
 
 # URL-encoded GitHub API path for the Script Includes folder
@@ -20,6 +23,8 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
+
+RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
 
 
 def gh_get(path: str, params: Optional[Dict] = None) -> requests.Response:
@@ -46,6 +51,34 @@ def get_raw(url: str) -> str:
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return r.text
+
+
+@lru_cache(maxsize=None)
+def latest_commit_datetime(path: str):
+    if not path:
+        return None
+    r = gh_get(
+        f"/repos/{OWNER}/{REPO}/commits",
+        params={"path": path, "sha": BRANCH, "per_page": 1},
+    )
+    commits = r.json()
+    if not commits:
+        return None
+    commit_info = commits[0].get("commit", {})
+    date_str = (
+        commit_info.get("committer", {}) or {}
+    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
+    if not date_str:
+        return None
+    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
+
+def is_recent(paths: List[str]) -> bool:
+    for path in paths:
+        ts = latest_commit_datetime(path)
+        if ts and ts > RECENCY_CUTOFF:
+            return True
+    return False
 
 
 def as_bool(val: Optional[str]) -> str:
@@ -142,6 +175,17 @@ def scrape() -> pd.DataFrame:
         # README.md
         readme_item = next((i for i in sub_items
                             if i.get("type") == "file" and i["name"].lower() == "readme.md"), None)
+        js_item = next((i for i in sub_items
+                        if i.get("type") == "file" and i["name"].lower().endswith(".js")), None)
+
+        candidates = [ent.get("path", "")]
+        if readme_item:
+            candidates.append(readme_item.get("path", ""))
+        if js_item:
+            candidates.append(js_item.get("path", ""))
+        if not is_recent(candidates):
+            continue
+
         readme_md = ""
         if readme_item and readme_item.get("download_url"):
             try:
@@ -150,8 +194,6 @@ def scrape() -> pd.DataFrame:
                 readme_md = ""
 
         # .js (script include code)
-        js_item = next((i for i in sub_items
-                        if i.get("type") == "file" and i["name"].lower().endswith(".js")), None)
         code = ""
         if js_item and js_item.get("download_url"):
             try:
@@ -186,7 +228,8 @@ def scrape() -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser(description="Scrape Script Includes from ServiceNowDevProgram/code-snippets")
-    ap.add_argument("--out", default="script_includes.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-xlsx", default="spreadsheets/script_includes.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-csv", default="spreadsheets/script_includes.csv", help="Output .csv filename")
     args = ap.parse_args()
 
     df = scrape()
@@ -202,8 +245,17 @@ def main():
         "active",
         "script"
     ]]
-    df.to_excel(args.out, index=False)
-    print(f"Saved {len(df)} rows to {args.out}")
+
+    out_dir = os.path.dirname(args.out_xlsx) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    df.to_excel(args.out_xlsx, index=False)
+    if args.out_csv:
+        df.to_csv(args.out_csv, index=False)
+
+    print(f"Saved {len(df)} rows to {args.out_xlsx}")
+    if args.out_csv:
+        print(f"Saved CSV export to {args.out_csv}")
 
 
 if __name__ == "__main__":

@@ -2,16 +2,18 @@ import os, re, time, argparse
 from datetime import datetime, timezone
 from functools import lru_cache
 from collections import defaultdict
-from dotenv import load_dotenv
 from typing import Dict, List
-import requests, pandas as pd
+
+import requests
+import pandas as pd
+from dotenv import load_dotenv
 
 OWNER  = "ServiceNowDevProgram"
 REPO   = "code-snippets"
 BRANCH = "main"
 
-# Repo folder that holds all integration scripts
-FOLDER = "Integration"
+# Repo folder that holds all Business Rules
+FOLDER = "Server-Side Components/Business Rules"
 
 API_BASE = "https://api.github.com"
 RAW_BASE = "https://raw.githubusercontent.com"
@@ -82,16 +84,16 @@ def is_recent(paths: List[str]) -> bool:
     return False
 
 
-def group_integration_files(tree: List[Dict]) -> Dict[str, Dict[str, Dict[str, str]]]:
+def group_business_rule_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
     """
-    Group integration script files by type_folder > snippet_folder.
-    Each snippet_folder represents an integration snippet.
+    Group business rule files by subfolder.
+    Each subfolder represents a business rule snippet.
     """
-    grouped = defaultdict(lambda: defaultdict(lambda: {
+    grouped = defaultdict(lambda: {
         "README": "",
         "CODE1": "",
         "CODE2": ""
-    }))
+    })
     prefix = f"{FOLDER}/"
     for node in tree:
         if node.get("type") != "blob":
@@ -100,24 +102,23 @@ def group_integration_files(tree: List[Dict]) -> Dict[str, Dict[str, Dict[str, s
         if not path.startswith(prefix):
             continue
 
-        rel = path[len(prefix):]  # e.g., "Scripted REST Api/Example Name/README.md"
+        rel = path[len(prefix):]  # e.g., "Example Name/README.md"
         parts = rel.split("/")
-        if len(parts) < 3:
+        if len(parts) < 2:
             continue
 
-        type_folder = parts[0]
-        snippet_folder = parts[1]
-        filename = "/".join(parts[2:])  # Handle if filename has spaces or subpaths
+        folder = parts[0]
+        filename = "/".join(parts[1:])  # Handle deeper paths
 
         low = filename.lower()
         if low == "readme.md":
-            grouped[type_folder][snippet_folder]["README"] = path
+            grouped[folder]["README"] = path
         elif low.endswith(".js"):
-            files = grouped[type_folder][snippet_folder]
+            files = grouped[folder]
             if not files["CODE1"]:
                 files["CODE1"] = path
             elif not files["CODE2"]:
-                files["CODE2"] = path  # Second .js file
+                files["CODE2"] = path
 
     return grouped
 
@@ -130,29 +131,91 @@ def extract_code_from_readme(readme: str) -> str:
     pattern = r'```(?:javascript|js)\s*\n(.*?)\n```'
     matches = re.findall(pattern, readme, re.DOTALL)
     if matches:
-        return matches[0].strip()  # Return the first/main code block
+        return matches[0].strip()
     return ""
 
 
-def build_row(type_folder: str, name: str, files: Dict[str, str]) -> Dict[str, str]:
+WHEN_PATTERNS = [
+    r"(?i)\bwhen\s*to\s*run\s*[:\-]\s*([^\n]+)",
+    r"(?i)\brun\s*when\s*[:\-]\s*([^\n]+)",
+    r"(?i)\bwhen\s*[:\-]\s*([^\n]+)",
+]
+
+COLLECTION_PATTERNS = [
+    r"(?i)\bcollection\s*[:\-]\s*([^\n]+)",
+    r"(?i)\btable\s*[:\-]\s*([^\n]+)",
+    r"(?i)\bon\s+table\s*[:\-]?\s*([^\n]+)",
+    r"(?i)\bruns?\s+on\s+table\s*[:\-]?\s*([^\n]+)",
+    r"(?i)\bapplies\s*to\s*[:\-]\s*([^\n]+)",
+]
+
+WHEN_KEYWORDS = ("before", "after", "async", "asynchronous", "display")
+
+
+def parse_when_to_run(md: str) -> str:
+    for pattern in WHEN_PATTERNS:
+        m = re.search(pattern, md)
+        if m:
+            return m.group(1).strip()
+    for line in md.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        lower = text.lower()
+        if any(keyword in lower for keyword in WHEN_KEYWORDS) and ("when" in lower or "run" in lower or "execution" in lower):
+            return text
+    return ""
+
+
+def parse_collection(md: str) -> str:
+    for pattern in COLLECTION_PATTERNS:
+        m = re.search(pattern, md)
+        if m:
+            return m.group(1).strip()
+    for line in md.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        lower = text.lower()
+        if "table" in lower or "collection" in lower:
+            return text
+    return ""
+
+
+def parse_collection_from_code(*codes: str) -> str:
+    gliderecord_pattern = re.compile(r"(?i)GlideRecord\(['\"]([A-Za-z0-9_\.]+)['\"]\)")
+    for code in codes:
+        if not code:
+            continue
+        m = gliderecord_pattern.search(code)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def build_row(name: str, files: Dict[str, str]) -> Dict[str, str]:
     readme = fetch_raw(files["README"]) if files["README"] else ""
     code1_path = files["CODE1"]
     code2_path = files["CODE2"]
     code1 = fetch_raw(code1_path) if code1_path else ""
     code2 = fetch_raw(code2_path) if code2_path else ""
 
-    # If no code files, try extracting from README
     if not code1:
         code1 = extract_code_from_readme(readme)
 
-    repo_path = f"{FOLDER}/{type_folder}/{name}"
+    repo_path = f"{FOLDER}/{name}"
+    when_to_run = parse_when_to_run(readme)
+    collection = parse_collection(readme)
+    if not collection:
+        collection = parse_collection_from_code(code1, code2)
 
     return {
         "title": name,
-        "description": readme,  # Full Markdown as requested
+        "description": readme,
         "code": code1,
         "code2": code2,
-        "type": type_folder,
+        "collection": collection,
+        "when_to_run": when_to_run,
         "repo_path": repo_path,
     }
 
@@ -160,36 +223,35 @@ def build_row(type_folder: str, name: str, files: Dict[str, str]) -> Dict[str, s
 def scrape() -> pd.DataFrame:
     sha = get_branch_sha()
     tree = list_tree_recursive(sha)
-    grouped = group_integration_files(tree)
+    grouped = group_business_rule_files(tree)
 
     rows = []
-    for type_folder in sorted(grouped.keys()):
-        for snippet_folder, files in sorted(grouped[type_folder].items()):
-            if not files["README"]:
-                continue
-            repo_path = f"{FOLDER}/{type_folder}/{snippet_folder}"
-            candidates = [
-                files["README"],
-                files["CODE1"],
-                files["CODE2"],
-                repo_path,
-            ]
-            if not is_recent(candidates):
-                continue
-            rows.append(build_row(type_folder, snippet_folder, files))
+    for folder, files in sorted(grouped.items()):
+        if not files["README"]:
+            continue
+        repo_path = f"{FOLDER}/{folder}"
+        candidates = [
+            files["README"],
+            files["CODE1"],
+            files["CODE2"],
+            repo_path,
+        ]
+        if not is_recent(candidates):
+            continue
+        rows.append(build_row(folder, files))
 
     return pd.DataFrame(rows)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Scrape Integration Scripts from code-snippets repo")
-    ap.add_argument("--out-xlsx", default="spreadsheets/integration_scripts.xlsx", help="Output .xlsx filename")
-    ap.add_argument("--out-csv", default="spreadsheets/integration_scripts.csv", help="Output .csv filename")
+    ap = argparse.ArgumentParser(description="Scrape Business Rules from code-snippets repo")
+    ap.add_argument("--out-xlsx", default="spreadsheets/business_rules.xlsx", help="Output .xlsx filename")
+    ap.add_argument("--out-csv", default="spreadsheets/business_rules.csv", help="Output .csv filename")
     args = ap.parse_args()
 
     df = scrape()
     df = df[[
-        "title", "description", "code", "code2", "type", "repo_path"
+        "title", "description", "code", "code2", "collection", "when_to_run", "repo_path"
     ]]
 
     out_dir = os.path.dirname(args.out_xlsx) or "."
@@ -199,7 +261,7 @@ def main():
     if args.out_csv:
         df.to_csv(args.out_csv, index=False)
 
-    print(f"Saved {len(df)} integration scripts to {args.out_xlsx}")
+    print(f"Saved {len(df)} business rules to {args.out_xlsx}")
     if args.out_csv:
         print(f"Saved CSV export to {args.out_csv}")
 
