@@ -1,6 +1,4 @@
 import os, re, time, argparse
-from datetime import datetime, timezone
-from functools import lru_cache
 from collections import defaultdict
 from typing import Dict, List
 
@@ -23,9 +21,6 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     S.headers.update({"Authorization": f"Bearer {TOKEN}"})
-
-RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
-
 
 def req(method: str, url: str, **kw):
     """HTTP request with retries/backoff for rate limits."""
@@ -53,35 +48,6 @@ def list_tree_recursive(sha: str) -> List[Dict]:
 def fetch_raw(path: str) -> str:
     url = f"{RAW_BASE}/{OWNER}/{REPO}/{BRANCH}/{path}"
     return req("GET", url).text
-
-
-@lru_cache(maxsize=None)
-def latest_commit_datetime(path: str):
-    if not path:
-        return None
-    r = req(
-        "GET",
-        f"{API_BASE}/repos/{OWNER}/{REPO}/commits",
-        params={"path": path, "sha": BRANCH, "per_page": 1},
-    )
-    commits = r.json()
-    if not commits:
-        return None
-    commit_info = commits[0].get("commit", {})
-    date_str = (
-        commit_info.get("committer", {}) or {}
-    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
-    if not date_str:
-        return None
-    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-
-
-def is_recent(paths: List[str]) -> bool:
-    for path in paths:
-        ts = latest_commit_datetime(path)
-        if ts and ts > RECENCY_CUTOFF:
-            return True
-    return False
 
 
 def group_business_rule_files(tree: List[Dict]) -> Dict[str, Dict[str, str]]:
@@ -145,6 +111,20 @@ WHEN_PATTERNS = [
 
 WHEN_KEYWORDS = ("before", "after", "async", "asynchronous", "display")
 
+TABLE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+TABLE_STOPWORDS = {
+    "a", "an", "and", "any", "applies", "apply", "be", "business", "can", "check",
+    "checks", "collection", "collections", "during", "for", "from", "help", "if",
+    "input", "in", "is", "it", "label", "log", "name", "names", "on", "open", "or",
+    "record", "records", "rule", "rules", "runs", "run", "so", "such", "table",
+    "tables", "that", "the", "this", "to", "value", "values", "when", "whenever",
+    "with", "as", "added", "appears", "allowed", "top", "easily", "during",
+    "changed", "other", "each",
+}
+TABLE_PREFIX_PREFERENCE = (
+    "sys_", "u_", "cmdb_", "sc_", "kb_", "sn_", "x_", "alm_", "hr_", "pa_", "asmt_", "svc_"
+)
+
 
 def normalize_when_value(text: str) -> str:
     if not text:
@@ -180,24 +160,87 @@ def parse_when_to_run(md: str) -> str:
 
 
 def extract_collection_candidates(md: str) -> List[str]:
-    pattern = re.compile(
-        r"(?i)\b(table|collection|runs?\s+on|applies\s+to)\s*[:\-]?\s*([`'\"]?[A-Za-z0-9_\.]+(?:[`'\"]?\s*,\s*[`'\"]?[A-Za-z0-9_\.]+)*)"
-    )
-    matches = pattern.findall(md)
+    patterns = [
+        r"(?i)\btable(?:\s+name)?\s*(?:is|:)?\s*([A-Za-z0-9_\-\s/]+)",
+        r"(?i)\bcollection(?:\s+name)?\s*(?:is|:)?\s*([A-Za-z0-9_\-\s/]+)",
+        r"(?i)\bruns?\s+on\s*(?:the)?\s*([A-Za-z0-9_\-\s/]+)",
+        r"(?i)\bapplies\s+to\s*(?:the)?\s*([A-Za-z0-9_\-\s/]+)",
+    ]
     results: List[str] = []
-    for _label, value in matches:
-        value = value.strip().strip("`'\"")
-        for part in re.split(r"\s*,\s*", value):
-            part = part.strip().strip("`'\"")
-            if part:
-                results.append(part)
+    seen = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, md):
+            segment = match.strip()
+            if not segment:
+                continue
+            segment = re.split(r"[\n\r.;]", segment, 1)[0]
+            parts = re.split(r"\s+(?:and|or)\s+|[,/]", segment)
+            for part in parts:
+                candidate = normalize_table_candidate(part)
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    results.append(candidate)
+    if not results:
+        fallback_pattern = re.compile(
+            r"\b(?:sys|u|cmdb|sc|kb|sn|x|alm|hr|pa|asmt)_[a-z0-9_]+\b",
+            re.IGNORECASE,
+        )
+        for match in fallback_pattern.findall(md):
+            candidate = normalize_table_candidate(match)
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                results.append(candidate)
     return results
+
+
+def normalize_table_candidate(raw: str) -> str:
+    if not raw:
+        return ""
+    cleaned = raw.strip().strip(":*-`'\"")
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("/", " ")
+    tokens = [tok for tok in re.split(r"\s+", cleaned) if tok]
+    if not tokens:
+        return ""
+    if len(tokens) > 3:
+        return ""
+    while tokens and tokens[0].lower() in TABLE_STOPWORDS:
+        tokens.pop(0)
+    while tokens and tokens[-1].lower() in TABLE_STOPWORDS:
+        tokens.pop()
+    if not tokens:
+        return ""
+    candidate_parts = []
+    for tok in tokens:
+        lowered = tok.lower().replace("-", "_")
+        if not lowered or lowered in TABLE_STOPWORDS:
+            return ""
+        if not TABLE_NAME_PATTERN.match(lowered.replace("_", "")):
+            return ""
+        candidate_parts.append(lowered)
+    candidate = "_".join(candidate_parts)
+    candidate = re.sub(r"[^\w]", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+    if not candidate:
+        return ""
+    if candidate in TABLE_STOPWORDS:
+        return ""
+    if len(candidate) < 3:
+        return ""
+    if not TABLE_NAME_PATTERN.match(candidate):
+        return ""
+    if len(candidate) > 40:
+        return ""
+    if len(candidate.split("_")) > 4:
+        return ""
+    return candidate
 
 
 def parse_collection(md: str) -> str:
     candidates = extract_collection_candidates(md)
     if candidates:
-        return candidates[0]
+        return select_best_table_candidate(candidates)
     return ""
 
 
@@ -210,6 +253,28 @@ def parse_collection_from_code(*codes: str) -> str:
         if m:
             return m.group(1).strip()
     return ""
+
+
+def select_best_table_candidate(candidates: List[str]) -> str:
+    best = candidates[0]
+    best_score = score_table_candidate(best)
+    for candidate in candidates[1:]:
+        score = score_table_candidate(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def score_table_candidate(name: str) -> int:
+    score = len(name)
+    if "_" in name:
+        score += 2
+    for prefix in TABLE_PREFIX_PREFERENCE:
+        if name.startswith(prefix):
+            score += 5
+            break
+    return score
 
 
 def build_row(name: str, files: Dict[str, str]) -> Dict[str, str]:
@@ -247,15 +312,6 @@ def scrape() -> pd.DataFrame:
     rows = []
     for folder, files in sorted(grouped.items()):
         if not files["README"]:
-            continue
-        repo_path = f"{FOLDER}/{folder}"
-        candidates = [
-            files["README"],
-            files["CODE1"],
-            files["CODE2"],
-            repo_path,
-        ]
-        if not is_recent(candidates):
             continue
         rows.append(build_row(folder, files))
 
