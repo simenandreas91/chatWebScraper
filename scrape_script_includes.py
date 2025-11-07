@@ -2,8 +2,6 @@ import os
 import re
 import time
 import argparse
-from datetime import datetime, timezone
-from functools import lru_cache
 from typing import Dict, List, Optional
 
 import requests
@@ -23,8 +21,6 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     SESSION.headers.update({"Authorization": f"Bearer {TOKEN}"})
-
-RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
 
 
 def gh_get(path: str, params: Optional[Dict] = None) -> requests.Response:
@@ -51,34 +47,6 @@ def get_raw(url: str) -> str:
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return r.text
-
-
-@lru_cache(maxsize=None)
-def latest_commit_datetime(path: str):
-    if not path:
-        return None
-    r = gh_get(
-        f"/repos/{OWNER}/{REPO}/commits",
-        params={"path": path, "sha": BRANCH, "per_page": 1},
-    )
-    commits = r.json()
-    if not commits:
-        return None
-    commit_info = commits[0].get("commit", {})
-    date_str = (
-        commit_info.get("committer", {}) or {}
-    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
-    if not date_str:
-        return None
-    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-
-
-def is_recent(paths: List[str]) -> bool:
-    for path in paths:
-        ts = latest_commit_datetime(path)
-        if ts and ts > RECENCY_CUTOFF:
-            return True
-    return False
 
 
 def as_bool(val: Optional[str]) -> str:
@@ -183,8 +151,6 @@ def scrape() -> pd.DataFrame:
             candidates.append(readme_item.get("path", ""))
         if js_item:
             candidates.append(js_item.get("path", ""))
-        if not is_recent(candidates):
-            continue
 
         readme_md = ""
         if readme_item and readme_item.get("download_url"):

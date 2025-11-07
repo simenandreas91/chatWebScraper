@@ -1,6 +1,4 @@
 import os, re, time, argparse
-from datetime import datetime, timezone
-from functools import lru_cache
 from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from typing import Any, Dict, List, Tuple
@@ -19,8 +17,6 @@ load_dotenv()
 TOKEN = os.getenv("GITHUB_TOKEN")
 if TOKEN:
     S.headers.update({"Authorization": f"Bearer {TOKEN}"})
-
-RECENCY_CUTOFF = datetime(2025, 10, 23, tzinfo=timezone.utc)
 
 
 def req(method: str, url: str, **kw):
@@ -48,35 +44,6 @@ def list_tree_recursive(sha: str) -> List[Dict]:
 def fetch_raw(path: str) -> str:
     url = f"{RAW_BASE}/{OWNER}/{REPO}/{BRANCH}/{path}"
     return req("GET", url).text
-
-
-@lru_cache(maxsize=None)
-def latest_commit_datetime(path: str):
-    if not path:
-        return None
-    r = req(
-        "GET",
-        f"{API_BASE}/repos/{OWNER}/{REPO}/commits",
-        params={"path": path, "sha": BRANCH, "per_page": 1},
-    )
-    commits = r.json()
-    if not commits:
-        return None
-    commit_info = commits[0].get("commit", {})
-    date_str = (
-        commit_info.get("committer", {}) or {}
-    ).get("date") or (commit_info.get("author", {}) or {}).get("date")
-    if not date_str:
-        return None
-    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-
-
-def is_recent(paths: List[str]) -> bool:
-    for path in paths:
-        ts = latest_commit_datetime(path)
-        if ts and ts > RECENCY_CUTOFF:
-            return True
-    return False
 
 
 def group_files(tree: List[Dict]) -> Dict[str, Dict[str, Any]]:
@@ -308,8 +275,6 @@ def scrape() -> pd.DataFrame:
     for folder, files in sorted(grouped.items()):
         repo_path = f"{FOLDER}/{folder}"
         candidates = [files["readme"], repo_path] + files["js"]
-        if not is_recent(candidates):
-            continue
 
         readme_md = fetch_raw(files["readme"]) if files["readme"] else ""
         readme_lines = readme_md.splitlines()
